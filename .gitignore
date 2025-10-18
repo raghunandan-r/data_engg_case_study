@@ -1,0 +1,21 @@
+# Environment files
+.env
+
+# Python cache
+__pycache__/
+*.pyc
+
+# Log and data files
+raw_events.jsonl
+processing_*.jsonl
+staging/
+archive/
+plan/
+nelo_growth_analytics.db
+dead_letter.log
+*.log
+.venv/
+.idea/
+debug_exports/
+*.db.wal
+BACKFILL_GUIDE.md
