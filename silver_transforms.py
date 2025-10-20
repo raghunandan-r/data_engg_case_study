@@ -927,60 +927,27 @@ def run_silver_transforms(
     logger.info("Successfully marked staged events as processed.")
 
 
-    logger.info("Creating silver list impressions view...")
+    logger.info("Creating silver purchases view...")
     con.execute(
         """
-        -- 1) Canonical sessions (persisted in Silver)
-        CREATE TABLE IF NOT EXISTS silver_user_sessions (
-            user_id VARCHAR,
-            platform_id INTEGER,
-            session_start_ts TIMESTAMP,
-            session_end_ts TIMESTAMP,
-            session_date DATE,
-            events_in_session INTEGER,
-            views INTEGER,
-            checkouts INTEGER,
-            purchases INTEGER,
-            PRIMARY KEY (user_id, platform_id, session_start_ts)
-        );
-
-        -- 2) Session features (persisted in Silver) for targeting
-        CREATE TABLE IF NOT EXISTS silver_session_features (
-            user_id VARCHAR,
-            platform_id INTEGER,
-            session_start_ts TIMESTAMP,
-            session_end_ts TIMESTAMP,
-            session_date DATE,
-            events_in_session INTEGER,
-            had_view BOOLEAN,
-            had_checkout BOOLEAN,
-            had_purchase BOOLEAN,
-            is_bounce BOOLEAN,
-            is_abandoned_checkout BOOLEAN,
-            cart_value_usd DECIMAL(12,6),
-            cart_products VARCHAR[],
-            is_high_value_abandoned_checkout BOOLEAN,
-            PRIMARY KEY (user_id, platform_id, session_start_ts)
-        );
-
-        -- 3) Finance purchases (view; event grain)
-        CREATE OR REPLACE VIEW silver_purchases AS
+        -- Finance purchases (view; event grain)
+            CREATE OR REPLACE VIEW silver_purchases AS
             SELECT
-            f.event_id,
-            f.user_id,
-            f.platform_id,
-            f.product_id,
-            u.credit_available,
-            f.item_revenue,
-            f.item_revenue_in_usd,
-            f.installments,
-            f.total_price AS original_price,
-            f.price AS discounted_price,
-            f.discount_value,
-            f.quantity,            
-            DATE(f.event_timestamp) AS date
+                f.event_id,
+                f.user_id,
+                f.platform_id,
+                f.product_id,
+                f.item_list_id,
+                f.item_revenue,
+                f.installments,
+                f.installment_price,
+                f.total_price,
+                f.price,
+                f.discount_value,
+                f.quantity,
+                f.event_timestamp,
+                DATE(f.event_timestamp) AS event_date
             FROM fct_events f
-            JOIN dim_users u ON u.user_id = f.user_id
             WHERE f.event_name = 'purchase';
         """
     )
@@ -1021,12 +988,11 @@ def run_silver_transforms(
         SELECT
             s.user_id, s.platform_id, s.session_start_ts,
             SUM(
-            CASE
+            DISTINCT(CASE
                 WHEN fe.event_name = 'begin_checkout'
-                THEN COALESCE(fe.total_price, fe.price * COALESCE(fe.quantity,1))
-                ELSE 0
+                THEN fe.price 
             END
-            ) AS cart_value_usd,
+            ) AS cart_value,
             LIST(DISTINCT CASE WHEN fe.event_name = 'begin_checkout' THEN fe.product_id END) AS cart_products
         FROM silver_user_sessions s
         LEFT JOIN fct_events fe
@@ -1038,7 +1004,7 @@ def run_silver_transforms(
         INSERT INTO silver_session_features (
             user_id, platform_id, session_start_ts, session_end_ts, session_date,
             events_in_session, had_view, had_checkout, had_purchase,
-            is_bounce, is_abandoned_checkout, cart_value_usd, cart_products,
+            is_bounce, is_abandoned_checkout, cart_value, cart_products,
             is_high_value_abandoned_checkout
         )
         SELECT
@@ -1049,9 +1015,9 @@ def run_silver_transforms(
             (s.purchases > 0) AS had_purchase,
             (s.events_in_session = 1)                 AS is_bounce,
             (s.checkouts > 0 AND s.purchases = 0)     AS is_abandoned_checkout,
-            COALESCE(c.cart_value_usd, 0)             AS cart_value_usd,
+            COALESCE(c.cart_value, 0)             AS cart_value,
             c.cart_products,
-            (s.checkouts > 0 AND s.purchases = 0 AND COALESCE(c.cart_value_usd,0) > {high_value_abandoned_checkout})
+            (s.checkouts > 0 AND s.purchases = 0 AND COALESCE(c.cart_value,0) > {high_value_abandoned_checkout})
                                                     AS is_high_value_abandoned_checkout
         FROM silver_user_sessions s
         LEFT JOIN cart c
@@ -1067,7 +1033,7 @@ def run_silver_transforms(
             had_purchase = EXCLUDED.had_purchase,
             is_bounce = EXCLUDED.is_bounce,
             is_abandoned_checkout = EXCLUDED.is_abandoned_checkout,
-            cart_value_usd = EXCLUDED.cart_value_usd,
+            cart_value = EXCLUDED.cart_value,
             cart_products = EXCLUDED.cart_products,
             is_high_value_abandoned_checkout = EXCLUDED.is_high_value_abandoned_checkout;
         """

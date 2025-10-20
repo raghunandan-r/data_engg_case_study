@@ -1,0 +1,43 @@
+{
+    "environment": "production",
+    "database_path": "nelo_analytics_rewrite.db",
+    "paths": {
+      "raw_events_file": "raw_events.jsonl",
+      "staging_dir": "staging",
+      "processed_dir": "processed",
+      "archive_dir": "archive",
+      "dead_letter_dir": "dead_letter",
+      "logs_dir": "logs",
+      "cache_dir": "seen_msg_cache"
+    },
+    "run_ts_format": "%Y%m%d_%H%M%S",
+    "sqs": {
+      "queue_url_env": "SQS_QUEUE_URL",
+      "polling": {
+        "max_messages_per_run": 10000,
+        "receive_batch_size": 10,
+        "wait_time_seconds": 5
+      },
+      "message_cache_ttl_seconds": 1209600
+    },
+    "staging": {
+      "staging_glob": "processing_batch_*.jsonl",
+      "db_connect": { "max_retries": 3, "retry_backoff_base_seconds": 0.5 }
+    },
+    "parsing": {
+      "required_fields": ["event_id", "event_name", "event_timestamp"],
+      "item_params_mappings": {
+        "discountt": "discount_value",
+        "totalPrice": "total_price",
+        "number_of_installments": "installments",
+        "installment_price": "installment_price",
+        "discounts": "discounts",
+        "in_stock": "is_in_stock"
+      },
+      "experiment_pattern": "NELO_XP_"
+    },
+    "silver": {
+      "session_minutes": 30,
+      "high_value_abandoned_checkout": 500
+    }
+  }

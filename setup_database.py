@@ -358,7 +358,45 @@ def setup_database():
     );
     """
     )
-    
+
+    logging.info("Creating silver sessions tables...")
+    con.execute(
+        """
+        -- 1) Canonical sessions (persisted in Silver)
+        CREATE TABLE IF NOT EXISTS silver_user_sessions (
+            user_id VARCHAR,
+            platform_id INTEGER,
+            session_start_ts TIMESTAMP,
+            session_end_ts TIMESTAMP,
+            session_date DATE,
+            events_in_session INTEGER,
+            views INTEGER,
+            checkouts INTEGER,
+            purchases INTEGER,
+            PRIMARY KEY (user_id, platform_id, session_start_ts)
+        );
+
+        -- 2) Session features (persisted in Silver) for targeting
+        CREATE TABLE IF NOT EXISTS silver_session_features (
+            user_id VARCHAR,
+            platform_id INTEGER,
+            session_start_ts TIMESTAMP,
+            session_end_ts TIMESTAMP,
+            session_date DATE,
+            events_in_session INTEGER,
+            had_view BOOLEAN,
+            had_checkout BOOLEAN,
+            had_purchase BOOLEAN,
+            is_bounce BOOLEAN,
+            is_abandoned_checkout BOOLEAN,
+            cart_value_usd DECIMAL(12,6),
+            cart_products VARCHAR[],
+            is_high_value_abandoned_checkout BOOLEAN,
+            PRIMARY KEY (user_id, platform_id, session_start_ts)
+        );
+    """
+    )
+
     con.execute(
         """
         CREATE TABLE IF NOT EXISTS fct_product_campaigns (
