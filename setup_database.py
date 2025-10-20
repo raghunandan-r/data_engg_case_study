@@ -3,7 +3,7 @@ import logging
 import duckdb
 
 # --- Configuration ---
-DB_FILE = "nelo_growth_analytics.db"
+DB_FILE = "nelo_analytics_rewrite.db"
 LOG_FILE = "etl.log"
 
 # --- Logging Setup ---
@@ -105,161 +105,158 @@ def setup_database():
 
     # Users Dimension Creation
     con.execute(
-        """
-    CREATE TABLE IF NOT EXISTS dim_users (
-        user_id VARCHAR PRIMARY KEY,
-        first_seen_timestamp TIMESTAMP,        -- Immutable after first set
-        acquisition_week DATE,                 -- For cohort analysis
-        acquisition_month DATE,                -- For monthly cohorts
+    """
+        CREATE SEQUENCE IF NOT EXISTS user_sk_seq START 1;
 
-        -- Aggregated metrics (updated each batch)
-        total_events INTEGER DEFAULT 0,
-        total_purchases INTEGER DEFAULT 0,
-        total_revenue DECIMAL(12,2) DEFAULT 0,
-        first_purchase_timestamp TIMESTAMP,
-        has_used_installments BOOLEAN DEFAULT false,
-
-        -- Lifecycle tracking
-        last_seen_timestamp TIMESTAMP,         -- Keep for convenience
-        days_since_acquisition INTEGER,        -- Derived: days between first_seen and now
-        lifetime_value DECIMAL(12,2),          -- Sum of all purchase revenue
-
-        -- Engagement scoring
-        total_view_items INTEGER DEFAULT 0,
-        total_checkouts INTEGER DEFAULT 0,
-
-        -- Audit
-        updated_at TIMESTAMP
-    );
+        CREATE TABLE IF NOT EXISTS dim_users (
+        user_sk BIGINT PRIMARY KEY DEFAULT NEXTVAL('user_sk_seq'),
+        user_id VARCHAR NOT NULL,                     -- NK
+        
+        source VARCHAR,
+        region VARCHAR,
+        customer_segment VARCHAR,
+        risk_segment VARCHAR,
+        credit_available DECIMAL(12,2),
+        
+        -- Attributes (no aggregates)
+        first_purchase_date DATE,
+        has_used_installments BOOLEAN,
+        -- SCD window
+        effective_start_date DATE NOT NULL,
+        effective_end_date DATE,                      -- NULL = open
+        is_active BOOLEAN DEFAULT TRUE,
+        UNIQUE (user_id, effective_start_date)
+        );
     """
     )
 
     con.execute(
         """
-    CREATE TABLE IF NOT EXISTS dim_products (
-        product_id VARCHAR PRIMARY KEY,
-        product_name VARCHAR,
-        msrp_in_usd DECIMAL(12, 2),
-
-        -- Aggregated metrics (updated each batch)
-        total_impressions INTEGER DEFAULT 0,      -- Count of view_item_list events
-        total_views INTEGER DEFAULT 0,             -- Count of view_item events
-        total_checkouts INTEGER DEFAULT 0,         -- Count of begin_checkout events
-        total_purchases INTEGER DEFAULT 0,         -- Count of purchase events
-        total_revenue DECIMAL(12,2) DEFAULT 0,     -- Sum of item_revenue_in_usd
-        total_purchases_with_installments INTEGER DEFAULT 0,
-        latest_price DECIMAL(12, 2) DEFAULT 0,
-
-        -- Audit
-        first_seen_timestamp TIMESTAMP,
-        last_seen_timestamp TIMESTAMP,
-        updated_at TIMESTAMP
-    );
-    """
+        CREATE INDEX IF NOT EXISTS idx_users_nk ON dim_users(user_id);
+        CREATE INDEX IF NOT EXISTS idx_users_range ON dim_users(user_id, effective_start_date, effective_end_date);
+        """
     )
+
     con.execute(
         """
+        CREATE SEQUENCE IF NOT EXISTS product_sk_seq START 1;
+
+        CREATE TABLE IF NOT EXISTS dim_products (
+            product_sk BIGINT PRIMARY KEY DEFAULT NEXTVAL('product_sk_seq'),
+            product_id VARCHAR NOT NULL,                  -- NK
+            product_name VARCHAR,
+            product_category VARCHAR,               -- from product catalog upstream
+            price DECIMAL(12,2),
+
+            -- SCD window
+            effective_start_date DATE NOT NULL,
+            effective_end_date DATE,
+            is_active BOOLEAN DEFAULT TRUE,
+            UNIQUE (product_id, effective_start_date)
+        );
+    """
+    )
+
+    con.execute(
+        """
+        CREATE INDEX IF NOT EXISTS idx_products_nk ON dim_products(product_id);
+        CREATE INDEX IF NOT EXISTS idx_products_range ON dim_products(product_id, effective_start_date, effective_end_date);
+        """
+    )    
+
+
+    con.execute(
+    """
+    CREATE SEQUENCE IF NOT EXISTS item_list_sk_seq START 1;
+
     CREATE TABLE IF NOT EXISTS dim_item_lists (
-        item_list_id VARCHAR PRIMARY KEY,
+        item_list_sk BIGINT PRIMARY KEY DEFAULT NEXTVAL('item_list_sk_seq'),
+        item_list_id VARCHAR NOT NULL,                 -- NK
         item_list_name VARCHAR,
 
-        -- List performance metrics (updated each batch)
-        total_impressions INTEGER DEFAULT 0,
-        total_attributed_clicks INTEGER DEFAULT 0,
-        total_checkouts INTEGER DEFAULT 0,
-        total_purchases INTEGER DEFAULT 0,
-        total_revenue DECIMAL(12,2) DEFAULT 0,
-        unique_users_exposed INTEGER DEFAULT 0,
-
-        -- Audit
-        first_seen_timestamp TIMESTAMP,
-        last_seen_timestamp TIMESTAMP,
-        updated_at TIMESTAMP
+        -- from item list catalog upstream
+        list_type VARCHAR,
+        targeting_customer_segment VARCHAR,
+        targeting_region VARCHAR,
+        associated_experiment_variant VARCHAR,
+        planned_start_date DATE,
+        planned_end_date DATE,
+        
+        -- SCD window
+        effective_start_date DATE NOT NULL,
+        effective_end_date DATE,
+        is_active BOOLEAN DEFAULT TRUE,
+        UNIQUE (item_list_id, effective_start_date)
     );
     """
     )
 
+
     # dim_platforms: Minimal lookup table (no aggregates)
-    # Platform metrics belong in Gold layer (gold_platform_daily_performance)
-    # See plan/dim_platforms_strategic_analysis.md for rationale
     con.execute(
         "CREATE TABLE IF NOT EXISTS dim_platforms (platform_id INTEGER PRIMARY KEY, platform_name VARCHAR UNIQUE);"
     )
-
-    # dim_campaigns: Enhanced with performance metrics
-    # See plan/dim_campaigns_experiments_analysis.md
-    con.execute(
-        """
-    CREATE TABLE IF NOT EXISTS dim_campaigns (
-        campaign_id VARCHAR PRIMARY KEY,
-        campaign_name VARCHAR,
-        planned_start_date DATE,
-        planned_end_date DATE,
-        is_active BOOLEAN,
-
-        logged_start_date DATE,
-        logged_end_date DATE,
-        total_users INTEGER DEFAULT 0,
-        total_events INTEGER DEFAULT 0,
-        total_impressions INTEGER DEFAULT 0,
-        total_views INTEGER DEFAULT 0,
-        total_checkouts INTEGER DEFAULT 0,
-        total_purchases INTEGER DEFAULT 0,
-
-        total_revenue DECIMAL(12,2) DEFAULT 0,
-        avg_order_value DECIMAL(12,2),
-
-        purchases_with_installments INTEGER DEFAULT 0,
-        installment_adoption_rate DECIMAL(5,2),
-
-        first_seen_timestamp TIMESTAMP,
-        last_seen_timestamp TIMESTAMP,
-        updated_at TIMESTAMP
-    );
-    """
-    )
-
-    # dim_experiments: Enhanced with conversion and revenue metrics
-    con.execute(
-        """
-    CREATE TABLE IF NOT EXISTS dim_experiments (
-        experiment_id VARCHAR PRIMARY KEY,
-        experiment_name VARCHAR,
-        variant_name VARCHAR,
-        planned_start_date DATE,
-        planned_end_date DATE,
-
-        logged_start_date DATE,
-        logged_end_date DATE,
-        is_active BOOLEAN,
-
-        total_users INTEGER DEFAULT 0,
-        total_events INTEGER DEFAULT 0,
-
-        total_views INTEGER DEFAULT 0,
-        total_purchases INTEGER DEFAULT 0,
-        conversion_rate DECIMAL(5,2),
-
-        total_revenue DECIMAL(12,2) DEFAULT 0,
-        avg_revenue_per_user DECIMAL(12,2),
-
-        sample_size_target INTEGER,
-        sample_size_achieved INTEGER,
-
-        first_seen_timestamp TIMESTAMP,
-        last_seen_timestamp TIMESTAMP,
-        updated_at TIMESTAMP
-    );
-    """
-    )
-
     con.execute(
         "INSERT INTO dim_platforms (platform_id, platform_name) VALUES (1, 'IOS'), (2, 'ANDROID') ON CONFLICT DO NOTHING;"
     )
+
+    # dim_campaigns: Enhanced with performance metrics
+    con.execute(
+    """
+    CREATE SEQUENCE IF NOT EXISTS campaign_sk_seq START 1;
+
+    CREATE TABLE IF NOT EXISTS dim_campaigns (
+        campaign_sk BIGINT PRIMARY KEY DEFAULT NEXTVAL('campaign_sk_seq'),
+        campaign_id VARCHAR NOT NULL,                 -- NK
+        campaign_name VARCHAR,
+        
+        -- from campaign catalog upstream
+        targeting_source VARCHAR,
+        targeting_segment VARCHAR,
+        targeting_risk_segment VARCHAR,
+        planned_start_date DATE,
+        planned_end_date DATE,
+
+        -- SCD window
+        effective_start_date DATE NOT NULL,           
+        effective_end_date DATE,                      
+        is_active BOOLEAN DEFAULT TRUE,
+        UNIQUE (campaign_id, effective_start_date)
+    );
+    """
+    )
+
+
+    # dim_experiments: Enhanced with conversion and revenue metrics
+    con.execute(
+    """
+    CREATE SEQUENCE IF NOT EXISTS experiment_sk_seq START 1;
+        
+    CREATE TABLE IF NOT EXISTS dim_experiments (
+        experiment_sk BIGINT PRIMARY KEY DEFAULT NEXTVAL('experiment_sk_seq'),
+        experiment_id VARCHAR NOT NULL,               -- NK
+        experiment_name VARCHAR,
+        
+        -- from experiment catalog upstream
+        variant_name VARCHAR,
+        targeting_source VARCHAR,
+        targeting_segment VARCHAR,
+        targeting_risk_segment VARCHAR,
+        planned_start_date DATE,
+        planned_end_date DATE,
+        
+        -- SCD window
+        effective_start_date DATE NOT NULL,           -- observed
+        effective_end_date DATE,
+        is_active BOOLEAN DEFAULT TRUE,
+        UNIQUE (experiment_id, effective_start_date)
+    );
+    """
+    )
+
     logging.info("Dimension tables are set up.")
 
     # Fact Table - Enhanced with all immutable measures
-    # See plan/fct_events_design_analysis.md for design rationale
     con.execute(
         """
     CREATE TABLE IF NOT EXISTS fct_events (
@@ -269,10 +266,10 @@ def setup_database():
         event_name VARCHAR,
 
         -- Foreign keys to dimensions
-        user_id VARCHAR REFERENCES dim_users(user_id),
-        product_id VARCHAR REFERENCES dim_products(product_id),
-        item_list_id VARCHAR REFERENCES dim_item_lists(item_list_id),
-        platform_id INTEGER REFERENCES dim_platforms(platform_id),
+        user_id VARCHAR, 
+        product_id VARCHAR,
+        item_list_id VARCHAR,
+        platform_id INTEGER,
         date_id DATE,
 
         -- Degenerate dimensions (codes stored as-is, no FK)
@@ -323,96 +320,70 @@ def setup_database():
     # """)
     logging.info("Fact table 'fct_events' is set up.")
 
-    # Gold Tables - Business-Ready Aggregates
+
+    # Silver persisted attribution (reusable in Gold)
     con.execute(
         """
-    CREATE TABLE IF NOT EXISTS gold_platform_daily_performance (
-        date DATE,
-        platform_id INTEGER REFERENCES dim_platforms(platform_id),
-
-        -- Engagement
-        total_events INTEGER,
-        unique_users INTEGER,
-
-        -- Funnel
-        total_impressions INTEGER,
-        total_views INTEGER,
-        total_checkouts INTEGER,
-        total_purchases INTEGER,
-
-        -- Revenue
-        total_revenue DECIMAL(12,2),
-        avg_order_value DECIMAL(12,2),
-
-        -- Fintech
-        purchases_with_installments INTEGER,
-        installment_adoption_rate DECIMAL(5,2),
-
-        PRIMARY KEY (date, platform_id)
+    CREATE TABLE IF NOT EXISTS silver_event_list_attribution (
+        event_id VARCHAR PRIMARY KEY,
+        user_id VARCHAR,
+        event_name VARCHAR,
+        event_timestamp TIMESTAMP,
+        item_list_id VARCHAR,
+        platform_id INTEGER,
+        session_id VARCHAR,
+        impression_ts_chosen TIMESTAMP,
+        attribution_model VARCHAR,
+        window_minutes INTEGER,
+        attribution_version INTEGER,
+        date_id DATE
     );
     """
     )
 
+
+    # Persisted silver list impressions to support session-based, last-touch attribution
     con.execute(
         """
-    CREATE TABLE IF NOT EXISTS gold_campaign_daily_performance (
-        date DATE,
-        campaign_id VARCHAR REFERENCES dim_campaigns(campaign_id),
-        platform_id INTEGER REFERENCES dim_platforms(platform_id),
-
-        unique_users INTEGER,
-        total_purchases INTEGER,
-        total_revenue DECIMAL(12,2),
-        conversion_rate DECIMAL(5,2),
-        installment_adoption_rate DECIMAL(5,2),
-
-        PRIMARY KEY (date, campaign_id, platform_id)
+    CREATE TABLE IF NOT EXISTS silver_list_impressions (
+        user_id VARCHAR,
+        platform_id INTEGER,
+        session_id VARCHAR,
+        session_start_ts TIMESTAMP,
+        session_date DATE,
+        item_list_id VARCHAR,
+        impression_ts TIMESTAMP,
+        date_id DATE,
+        PRIMARY KEY (user_id, platform_id, session_start_ts, item_list_id, impression_ts)
     );
     """
     )
-
+    
     con.execute(
         """
-    CREATE TABLE IF NOT EXISTS gold_product_daily_performance (
-        date DATE,
-        product_id VARCHAR REFERENCES dim_products(product_id),
+        CREATE TABLE IF NOT EXISTS fct_product_campaigns (
+            product_id VARCHAR NOT NULL,
+            campaign_id VARCHAR NOT NULL,
+            price DECIMAL(12,2) NOT NULL,
+            discount_value DECIMAL(10,2) NOT NULL,
 
-        total_impressions INTEGER,
-        total_views INTEGER,
-        total_checkouts INTEGER,
-        total_purchases INTEGER,
-        total_revenue DECIMAL(12,2),
-        conversion_rate DECIMAL(5,2),
-        avg_order_value DECIMAL(12,2),
+            total_events INTEGER NOT NULL,
+            views INTEGER NOT NULL,
+            checkouts INTEGER NOT NULL,
+            purchases INTEGER NOT NULL,
+            revenue DECIMAL(12,2) NOT NULL,
 
-        PRIMARY KEY (date, product_id)
-    );
-    """
-    )
+            first_seen_date DATE NOT NULL,
+            last_seen_date DATE NOT NULL,
 
-    logging.info("Gold tables are set up.")
-
-    # Date Dimension
-    con.execute(
+            PRIMARY KEY (product_id, campaign_id, price, discount_value)
+        );
         """
-    -- Generate date dimension for 10 years
-        INSERT INTO dim_dates
-        SELECT
-            date_key,
-            YEAR(date_key) as year,
-            MONTH(date_key) as month,
-            DAY(date_key) as day,
-            DAYOFWEEK(date_key) as day_of_week,
-            CASE WHEN DAYOFWEEK(date_key) IN (0, 6) THEN true ELSE false END as is_weekend,
-            MONTHNAME(date_key) as month_name,
-            QUARTER(date_key) as quarter
-        FROM (
-            SELECT DATE '2020-01-01' + INTERVAL (n) DAY as date_key
-            FROM generate_series(0, 3652) as t(n)  -- ~10 years
-        )
-        ON CONFLICT DO NOTHING;
-    """
     )
+    con.execute("CREATE INDEX IF NOT EXISTS idx_fpc_campaign ON fct_product_campaigns(campaign_id);")
+    con.execute("CREATE INDEX IF NOT EXISTS idx_fpc_product ON fct_product_campaigns(product_id);")
+
+
     con.close()
     logging.info("Database setup complete. Connection closed.")
 

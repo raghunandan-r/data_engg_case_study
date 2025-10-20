@@ -3,6 +3,7 @@ python-dotenv==1.1.1
 duckdb==1.4.1
 pandas==2.3.3
 PyYAML==6.0
+diskcache==5.6.3
 
 # Linting and Code Quality
 pre-commit==3.6.0
@@ -13,3 +14,4 @@ mypy==1.8.0
 shellcheck-py==0.10.0.1
 sqlfluff==2.3.5
 great-expectations==0.18.8
+pytest==8.4.2

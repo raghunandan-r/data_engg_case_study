@@ -15,8 +15,9 @@ import pandas as pd
 
 from logging_utils import configure_logging
 from silver_transforms import run_silver_transforms
+from gold_transforms import run_gold_transforms
 
-DB_FILE = "nelo_growth_analytics.db"
+DB_FILE = "nelo_analytics_rewrite.db"
 STAGING_DIR = "staging"
 PROCESSED_DIR = "processed"
 LOG_FILE = "etl.log"
@@ -222,7 +223,8 @@ def parse_single_item(item_str: str) -> dict:
 
     # Top-level string fields
     for field in ["item_id", "item_name", "item_list_id", "item_list_name"]:
-        pattern = rf"{field}=([^,\]]+?)(?:,|\s*(?:item_|price_|quantity|coupon|affiliation|location|promotion|creative|item_params))"
+        # Replace the pattern line with:
+        pattern = rf"{field}=([^,}}]+?)(?:\s*,|\s*(?:item_|price_|quantity|coupon|affiliation|location|promotion|creative|item_params))"
         match = re.search(pattern, item_str)
         if match:
             val = match.group(1).strip()
@@ -563,35 +565,57 @@ def main():
 
     for filepath in staging_files:
         try:
+            # --- Transaction 1: Staging and Silver ---
             con.begin()
             if process_staging_file(filepath, con, run_ts, logger, fmt):
                 # Run Silver transforms within same transaction as staging insert
                 logger.info("Running silver transforms...")
-                run_silver_transforms(con, logger)
+                run_silver_transforms(con, logger, session_minutes=30)
                 logger.info("Silver transforms executed successfully.")
 
-                # Commit both staging and silver transforms together
+                # Commit staging and silver transforms together
                 con.commit()
-                logger.info("Transaction committed successfully.")
+                logger.info("Staging and Silver transaction committed successfully.")
 
-                # Move file to processed directory after successful commit
+                # Move file to processed directory only after successful commit
                 dest_path = os.path.join(PROCESSED_DIR, os.path.basename(filepath))
                 os.rename(filepath, dest_path)
                 logger.info(f"Moved {filepath} to {dest_path}")
+
             else:
                 con.rollback()
                 logger.warning(
                     f"Rolled back transaction for file {filepath}. File not moved."
                 )
+                continue  # Skip to the next file if staging/silver failed
+
+            # --- Transaction 2: Gold ---
+            # This runs outside the first transaction. If it fails, the Silver data is already safe.
+            # try:
+            #     logger.info("Running gold transforms in a separate transaction...")
+            #     con.begin()
+            #     run_gold_transforms(con, logger )
+            #     con.commit()
+            #     logger.info("Gold transforms transaction committed successfully.")
+            # except Exception as gold_err:
+            #     con.rollback()
+            #     logger.error(
+            #         f"Gold transforms failed for batch from {filepath}. Silver data is preserved. Error: {gold_err}",
+            #         exc_info=True,
+            #     )
+            #     # This error will still propagate up and fail the run, which is desired.
+            #     raise
+
         except Exception as e:
             try:
                 con.rollback()
                 logger.error(
-                    f"Transaction for {filepath} failed: {e}. Rolled back.",
+                    f"Main transaction for {filepath} failed: {e}. Rolled back.",
                     exc_info=True,
                 )
             except Exception as rollback_err:
                 logger.error(f"Rollback also failed: {rollback_err}", exc_info=True)
+
 
     con.close()
     logger.info("--- Staging Processing Finished ---")

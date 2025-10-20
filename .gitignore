@@ -11,11 +11,16 @@ processing_*.jsonl
 staging/
 archive/
 plan/
-nelo_growth_analytics.db
+.cursor/
+.github/
+seen_msg_cache/
 dead_letter.log
 *.log
 .venv/
 .idea/
 debug_exports/
 *.db.wal
+*.db
+
 BACKFILL_GUIDE.md
+

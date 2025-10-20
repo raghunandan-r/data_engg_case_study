@@ -1,172 +1,126 @@
 import logging
+import os
+from datetime import datetime
 
 import duckdb
 
-from logging_utils import setup_logging
+from logging_utils import configure_logging
 
-# Setup logging
-setup_logging()
-logger = logging.getLogger(__name__)
-
-DB_PATH = "nelo_growth_analytics.db"
+DB_FILE = "nelo_analytics_rewrite.db"
 
 
-def run_gold_transforms():
+def run_gold_transforms(con: duckdb.DuckDBPyConnection, logger: logging.Logger):
     """
     Main function to run all gold layer transformations.
     Connects to DuckDB and executes the transform functions.
     """
+    logger.info("--- Starting Gold Layer Transformations ---")
     try:
-        con = duckdb.connect(database=DB_PATH, read_only=False)
-        logger.info("Successfully connected to DuckDB.")
+        create_gold_product_campaign_semantic_views(con, logger)
 
-        # Gold layer transformations
-        populate_gold_platform_daily_performance(con)
-        populate_gold_campaign_daily_performance(con)
-        populate_gold_product_daily_performance(con)
-
-        logger.info("Gold layer transformations completed successfully.")
+        logger.info("--- Gold Layer Transformations Completed Successfully ---")
 
     except Exception as e:
-        logger.error(f"An error occurred during gold transformations: {e}")
-    finally:
-        if "con" in locals() and con:
-            con.close()
-            logger.info("DuckDB connection closed.")
+        logger.error(f"An error occurred during gold transformations: {e}", exc_info=True)
+        raise  # Re-raise to allow transaction rollback in the caller
 
 
-def populate_gold_platform_daily_performance(con):
-    """
-    Populates the gold_platform_daily_performance table by aggregating
-    data from fct_events. This provides a daily snapshot of platform metrics.
-    """
-    logger.info("Populating gold_platform_daily_performance...")
-    # Logic from plan/dim_platforms_strategic_analysis.md
+def create_gold_product_campaign_semantic_views(con, logger):
+    logger.info("Creating gold product campaign semantic views...")
+
+    # 1) Price change events during active campaigns (observed pairs only if fct_product_campaigns exists)
     con.execute(
         """
-        INSERT INTO gold_platform_daily_performance
-        SELECT
-            DATE(event_timestamp) as date,
-            platform_id,
-            COUNT(*) as total_events,
-            COUNT(DISTINCT user_id) as unique_users,
-            COUNT(CASE WHEN event_name = 'view_item_list' THEN 1 END) as total_impressions,
-            COUNT(CASE WHEN event_name = 'view_item' THEN 1 END) as total_views,
-            COUNT(CASE WHEN event_name = 'begin_checkout' THEN 1 END) as total_checkouts,
-            COUNT(CASE WHEN event_name = 'purchase' THEN 1 END) as total_purchases,
-            SUM(CASE WHEN event_name = 'purchase' THEN item_revenue_in_usd ELSE 0 END) as total_revenue,
-            AVG(CASE WHEN event_name = 'purchase' THEN item_revenue_in_usd END) as avg_order_value,
-            COUNT(CASE WHEN event_name = 'purchase' AND installments > 0 THEN 1 END) as purchases_with_installments,
-            (COUNT(CASE WHEN event_name = 'purchase' AND installments > 0 THEN 1 END)::DECIMAL /
-             NULLIF(COUNT(CASE WHEN event_name = 'purchase' THEN 1 END), 0)) * 100 as installment_adoption_rate
-        FROM fct_events
-        GROUP BY DATE(event_timestamp), platform_id
-        ON CONFLICT (date, platform_id) DO UPDATE SET
-            total_events = EXCLUDED.total_events,
-            unique_users = EXCLUDED.unique_users,
-            total_impressions = EXCLUDED.total_impressions,
-            total_views = EXCLUDED.total_views,
-            total_checkouts = EXCLUDED.total_checkouts,
-            total_purchases = EXCLUDED.total_purchases,
-            total_revenue = EXCLUDED.total_revenue,
-            avg_order_value = EXCLUDED.avg_order_value,
-            purchases_with_installments = EXCLUDED.purchases_with_installments,
-            installment_adoption_rate = EXCLUDED.installment_adoption_rate;
-    """
-    )
-    logger.info("Finished populating gold_platform_daily_performance.")
-
-
-def populate_gold_campaign_daily_performance(con):
-    """
-    Populates gold_campaign_daily_performance table.
-    This involves unnesting the pipe-separated campaign codes from fct_events
-    to correctly attribute events to each campaign.
-    """
-    logger.info("Populating gold_campaign_daily_performance...")
-    # Logic from plan/dim_campaigns_experiments_analysis.md
-    con.execute(
-        """
-        INSERT INTO gold_campaign_daily_performance
-        WITH exploded AS (
+        CREATE OR REPLACE VIEW vw_gold_product_campaign_price_change_events AS
+        WITH changes AS (
             SELECT
-                DATE(event_timestamp) as date,
-                UNNEST(string_split(campaign_codes, '|')) AS campaign_id,
-                platform_id,
-                event_name,
-                user_id,
-                item_revenue_in_usd,
-                installments
-            FROM fct_events
-            WHERE campaign_codes IS NOT NULL
+                product_id,
+                LAG(price) OVER (PARTITION BY product_id ORDER BY effective_start_date) AS old_price,
+                price AS new_price,
+                effective_start_date AS change_date
+            FROM dim_products
         )
         SELECT
-            date,
-            campaign_id,
-            platform_id,
-            COUNT(DISTINCT user_id) AS unique_users,
-            COUNT(CASE WHEN event_name = 'purchase' THEN 1 END) AS total_purchases,
-            SUM(CASE WHEN event_name = 'purchase' THEN item_revenue_in_usd ELSE 0 END) AS total_revenue,
-            (COUNT(CASE WHEN event_name = 'purchase' THEN 1 END)::DECIMAL /
-             NULLIF(COUNT(CASE WHEN event_name = 'view_item' THEN 1 END), 0)) * 100 AS conversion_rate,
-            (COUNT(CASE WHEN event_name = 'purchase' AND installments > 0 THEN 1 END)::DECIMAL /
-             NULLIF(COUNT(CASE WHEN event_name = 'purchase' THEN 1 END), 0)) * 100 AS installment_adoption_rate
-        FROM exploded
-        GROUP BY date, campaign_id, platform_id
-        ON CONFLICT (date, campaign_id, platform_id) DO UPDATE SET
-            unique_users = EXCLUDED.unique_users,
-            total_purchases = EXCLUDED.total_purchases,
-            total_revenue = EXCLUDED.total_revenue,
-            conversion_rate = EXCLUDED.conversion_rate,
-            installment_adoption_rate = EXCLUDED.installment_adoption_rate;
-    """
+            g.campaign_id,
+            c.campaign_name,
+            ch.product_id,
+            ch.change_date,
+            ch.old_price,
+            ch.new_price,
+            (ch.new_price - ch.old_price) / NULLIF(ch.old_price, 0) AS delta_pct
+        FROM changes ch
+        JOIN dim_campaigns c
+          ON c.effective_start_date <= ch.change_date
+         AND (c.effective_end_date IS NULL OR ch.change_date < c.effective_end_date)
+        JOIN fct_product_campaigns g
+          ON g.product_id = ch.product_id
+         AND g.campaign_id = c.campaign_id
+         AND g.first_seen_date <= ch.change_date
+         AND ch.change_date <= g.last_seen_date
+        WHERE ch.old_price IS NOT NULL AND ch.new_price IS DISTINCT FROM ch.old_price;
+        """
     )
-    logger.info("Finished populating gold_campaign_daily_performance.")
 
-
-def populate_gold_product_daily_performance(con):
-    """
-    Populates gold_product_daily_performance table with daily product metrics.
-    """
-    logger.info("Populating gold_product_daily_performance...")
+    # 2) Current status: active campaign x active product with current price and discount flags
+    # Uses fct_product_campaigns (small) instead of scanning fct_events.
     con.execute(
         """
-        INSERT INTO gold_product_daily_performance (
-            date,
-            product_id,
-            total_impressions,
-            total_views,
-            total_checkouts,
-            total_purchases,
-            total_revenue,
-            conversion_rate,
-            avg_order_value
+        CREATE OR REPLACE VIEW vw_gold_product_campaign_current_status AS
+        WITH current_products AS (
+            SELECT product_id, price
+            FROM dim_products
+            WHERE is_active = TRUE
+        ),
+        current_campaigns AS (
+            SELECT campaign_id, campaign_name
+            FROM dim_campaigns
+            WHERE is_active = TRUE
         )
         SELECT
-            DATE(event_timestamp) AS date,
-            product_id,
-            COUNT(CASE WHEN event_name = 'view_item_list' THEN 1 END) AS total_impressions,
-            COUNT(CASE WHEN event_name = 'view_item' THEN 1 END) AS total_views,
-            COUNT(CASE WHEN event_name = 'begin_checkout' THEN 1 END) AS total_checkouts,
-            COUNT(CASE WHEN event_name = 'purchase' THEN 1 END) AS total_purchases,
-            SUM(CASE WHEN event_name = 'purchase' THEN item_revenue_in_usd ELSE 0 END) AS total_revenue,
-            (COUNT(CASE WHEN event_name = 'purchase' THEN 1 END)::DECIMAL / NULLIF(COUNT(CASE WHEN event_name = 'view_item' THEN 1 END), 0)) * 100 AS conversion_rate,
-            (SUM(CASE WHEN event_name = 'purchase' THEN item_revenue_in_usd ELSE 0 END) / NULLIF(COUNT(CASE WHEN event_name = 'purchase' THEN 1 END), 0)) AS avg_order_value
-        FROM fct_events
-        WHERE product_id IS NOT NULL
-        GROUP BY DATE(event_timestamp), product_id
-        ON CONFLICT (date, product_id) DO UPDATE SET
-            total_impressions = EXCLUDED.total_impressions,
-            total_views = EXCLUDED.total_views,
-            total_checkouts = EXCLUDED.total_checkouts,
-            total_purchases = EXCLUDED.total_purchases,
-            total_revenue = EXCLUDED.total_revenue,
-            conversion_rate = EXCLUDED.conversion_rate,
-            avg_order_value = EXCLUDED.avg_order_value;
-    """
+            c.campaign_id,
+            c.campaign_name,
+            p.product_id,
+            p.price AS current_price,            
+            /* has_discount_today: observed combos whose last_seen_date is today and discount_value > 0 */
+            MAX(CASE WHEN f.discount_value > 0 AND f.last_seen_date = CURRENT_DATE THEN 1 ELSE 0 END) AS has_discount_today,
+            /* has_discount_recent: any observed discount historically while dims are currently active */
+            MAX(CASE WHEN f.discount_value > 0 THEN 1 ELSE 0 END) AS has_discount_recent,
+            COALESCE(MAX(CASE WHEN f.last_seen_date = CURRENT_DATE THEN f.discount_value / NULLIF(p.price, 0) * 100 END), 0) AS current_discount_percentage
+        FROM current_campaigns c
+        JOIN fct_product_campaigns f
+          ON f.campaign_id = c.campaign_id
+        JOIN current_products p
+          ON p.product_id = f.product_id
+        GROUP BY c.campaign_id, c.campaign_name, p.product_id, p.price;
+        """
     )
-    logger.info("Finished populating gold_product_daily_performance.")
+
+    logger.info("Gold product campaign semantic views created.")
+
 
 
 if __name__ == "__main__":
-    run_gold_transforms()
+    run_ts = os.getenv("RUN_TS") or datetime.now().strftime("%Y%m%d_%H%M%S")
+    logger, _ = configure_logging(
+        f"logs/gold_transforms_{run_ts}.log", logger_name="gold_transforms"
+    )
+
+    con = None
+    try:
+        con = duckdb.connect(database=DB_FILE, read_only=False)
+        logger.info("Successfully connected to DuckDB for standalone run.")
+
+        con.begin()
+        run_gold_transforms(con, logger)
+        con.commit()
+        logger.info("Standalone gold transforms committed.")
+
+    except Exception as e:
+        logger.error(f"Standalone gold transformations run failed: {e}", exc_info=True)
+        if con:
+            con.rollback()
+            logger.info("Transaction rolled back.")
+    finally:
+        if con:
+            con.close()
+            logger.info("DuckDB connection closed.")
