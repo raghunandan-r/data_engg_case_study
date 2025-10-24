@@ -13,13 +13,17 @@ from typing import Dict, List, Tuple
 import duckdb
 import pandas as pd
 
+from config_loader import load_config
+from gold_transforms import run_gold_transforms
 from logging_utils import configure_logging
 from silver_transforms import run_silver_transforms
-from gold_transforms import run_gold_transforms
 
-DB_FILE = "nelo_analytics_rewrite.db"
-STAGING_DIR = "staging"
-PROCESSED_DIR = "processed"
+# Load configuration
+cfg = load_config()
+
+DB_FILE = cfg.get("database_path")
+STAGING_DIR = cfg.get("paths.staging_dir")
+PROCESSED_DIR = cfg.get("paths.processed_dir")
 LOG_FILE = "etl.log"
 
 
@@ -30,7 +34,9 @@ def validate_and_coerce(df: pd.DataFrame, logger) -> Tuple[pd.DataFrame, List[Di
     """
     Return (good_df, bad_records). bad_records contain {'stage':'validate','error':..., 'flat_record':..., 'raw_event':...}
     """
-    required_cols = ["event_id", "event_name", "event_timestamp"]
+    required_cols = cfg.get(
+        "parsing.required_fields", ["event_id", "event_name", "event_timestamp"]
+    )
     bad = []
     good_rows = []
 
@@ -119,9 +125,12 @@ def parse_discount_codes(discount_str):
     experiment_variant = None
     campaign_list = []
 
+    # Get experiment pattern from config
+    experiment_pattern = cfg.get("parsing.experiment_pattern", "NELO_XP_")
+
     for code in codes:
         # Check for experiment patterns (NELO_XP_XX format)
-        if "NELO_XP_" in code:
+        if experiment_pattern in code:
             experiment_variant = code
         else:
             campaign_list.append(code)
@@ -246,14 +255,18 @@ def parse_single_item(item_str: str) -> dict:
             result[field] = float(val) if "." in val else int(val)
 
     # item_params extraction - find the value for each known key
-    param_keys = {
-        "discountt": "discount_value",
-        "totalPrice": "total_price",
-        "number_of_installments": "installments",
-        "installment_price": "installment_price",
-        "discounts": "discounts",
-        "in_stock": "is_in_stock",
-    }
+    # Get mappings from config
+    param_keys = cfg.get(
+        "parsing.item_params_mappings",
+        {
+            "discountt": "discount_value",
+            "totalPrice": "total_price",
+            "number_of_installments": "installments",
+            "installment_price": "installment_price",
+            "discounts": "discounts",
+            "in_stock": "is_in_stock",
+        },
+    )
 
     for param_key, result_key in param_keys.items():
         # Try all possible value fields (double, float, int, string)
@@ -270,9 +283,9 @@ def parse_single_item(item_str: str) -> dict:
                             float(clean_val) if "." in clean_val else int(clean_val)
                         )
                     else:
-                        result[result_key] = (
-                            val_str  # Keep as string only if not numeric
-                        )
+                        result[
+                            result_key
+                        ] = val_str  # Keep as string only if not numeric
                     break
 
     return result
@@ -316,7 +329,6 @@ def process_events_to_df(events):
 
         # The parser already returns dicts with all fields extracted and flattened
         for item in items_data:
-
             discount_info = parse_discount_codes(item.get("discounts"))
 
             flat_record = {
@@ -367,12 +379,14 @@ def process_staging_file(filepath, con, run_ts, logger, fmt):
     """Processes a single staging files and loads into the DuckDB."""
 
     file_basename = os.path.basename(filepath).replace(".jsonl", "")
-    per_file_log = f"logs/processing_{file_basename}_{run_ts}.log"
+    logs_dir = cfg.get("paths.logs_dir", "logs")
+    per_file_log = f"{logs_dir}/processing_{file_basename}_{run_ts}.log"
     file_fh = logging.FileHandler(per_file_log)
     file_fh.setFormatter(fmt)
     logger.addHandler(file_fh)
 
-    dlq_path = f"dead_letter/process_staging_failures_{run_ts}.jsonl"
+    dlq_dir = cfg.get("paths.dead_letter_dir", "dead_letter")
+    dlq_path = f"{dlq_dir}/process_staging_failures_{run_ts}.jsonl"
     started = datetime.now()
     logger.info(f"Processing staging file: {filepath}")
 
@@ -414,9 +428,6 @@ def process_staging_file(filepath, con, run_ts, logger, fmt):
             logging.info(f"No records in {filepath}. Skipping.")
             return True
 
-        # Add processed_at column (will be set to NULL initially, updated by silver_transforms)
-        df["processed_at"] = None
-
         # VALIDATE
         df_good, validate_dead = validate_and_coerce(df, logger)
         append_dead_letters(validate_dead, dlq_path)
@@ -432,7 +443,6 @@ def process_staging_file(filepath, con, run_ts, logger, fmt):
             "event_name",
             "event_timestamp",
             "replay_timestamp",
-            "ingestion_timestamp",
             "user_id",
             "platform",
             "item_list_id",
@@ -452,7 +462,7 @@ def process_staging_file(filepath, con, run_ts, logger, fmt):
             "installment_price",
             "is_in_stock",
             "raw_event",
-            "processed_at",
+            "ingestion_timestamp",
         ]
 
         # Select and reorder columns (all should exist now)
@@ -461,11 +471,12 @@ def process_staging_file(filepath, con, run_ts, logger, fmt):
         # BULK INSERT (append-only, no deduplication at staging layer)
         inserted = 0
         try:
+            cols = ", ".join(stg_columns)
             con.register("df_to_load", df_good)
             con.execute(
-                """
+                f"""
                 INSERT INTO stg_events
-                SELECT * FROM df_to_load
+                SELECT {cols} FROM df_to_load
             """
             )
             con.unregister("df_to_load")
@@ -473,6 +484,8 @@ def process_staging_file(filepath, con, run_ts, logger, fmt):
             logger.info(f"Bulk insert succeeded: rows={inserted}")
         except Exception as e:
             logger.error(f"Bulk insert failed, falling back to row-wise: {e}")
+            con.rollback()
+            con.begin()
             # ROW-WISE FALLBACK to catch per-row insert poison pills
             row_dead = []
             insert_sql = f"""
@@ -503,7 +516,7 @@ def process_staging_file(filepath, con, run_ts, logger, fmt):
             f"File done: {filepath} lines={total_lines} parsed_ok={len(parsed_events)} "
             f"flattened={len(df)} inserted={inserted} duration_s={took:.2f}"
         )
-        return True
+        return inserted > 0
 
     except Exception as e:
         logger.error(f"Fatal error processing {filepath}: {e}", exc_info=True)
@@ -514,17 +527,23 @@ def process_staging_file(filepath, con, run_ts, logger, fmt):
 
 
 def main():
-    run_ts = os.getenv("RUN_TS") or datetime.now().strftime("%Y%m%d_%H%M%S")
+    run_ts = os.getenv("RUN_TS") or datetime.now().strftime(
+        cfg.get("run_ts_format", "%Y%m%d_%H%M%S")
+    )
+    logs_dir = cfg.get("paths.logs_dir", "logs")
     logger, fmt = configure_logging(
-        f"logs/process_staging_{run_ts}.log", logger_name="process_staging"
+        f"{logs_dir}/process_staging_{run_ts}.log", logger_name="process_staging"
     )
     logger.info("--- Starting Staging Processing ---")
     os.makedirs(PROCESSED_DIR, exist_ok=True)
 
     # DuckDB connect with retries ONLY for transient file lock issues
+    max_retries = cfg.get("staging.db_connect.max_retries", 3)
+    retry_backoff_base = cfg.get("staging.db_connect.retry_backoff_base_seconds", 0.5)
+
     con = None
     last_err = None
-    for attempt in range(3):
+    for attempt in range(max_retries):
         try:
             con = duckdb.connect(database=DB_FILE, read_only=False)
             break
@@ -534,11 +553,13 @@ def main():
             error_msg = str(e).lower()
             if "lock" in error_msg or "permission" in error_msg:
                 last_err = e
-                logger.warning(f"DuckDB connect failed (attempt {attempt+1}/3): {e}")
-                if attempt < 2:  # Don't sleep on last attempt
+                logger.warning(
+                    f"DuckDB connect failed (attempt {attempt+1}/{max_retries}): {e}"
+                )
+                if attempt < max_retries - 1:  # Don't sleep on last attempt
                     import time
 
-                    time.sleep(0.5 * (2**attempt))
+                    time.sleep(retry_backoff_base * (2**attempt))
             else:
                 # Non-retryable IO error (e.g., file not found, disk full)
                 logger.error(f"DuckDB connect failed with non-retryable IO error: {e}")
@@ -555,10 +576,13 @@ def main():
             return
 
     if con is None:
-        logger.error(f"Failed to connect to DuckDB after retries: {last_err}")
+        logger.error(
+            f"Failed to connect to DuckDB after {max_retries} retries: {last_err}"
+        )
         return
 
-    staging_files = glob.glob(os.path.join(STAGING_DIR, "processing_batch_*.jsonl"))
+    staging_glob = cfg.get("staging.staging_glob", "processing_batch_*.jsonl")
+    staging_files = glob.glob(os.path.join(STAGING_DIR, staging_glob))
     if not staging_files:
         logger.info("No files found in staging directory. Exiting.")
         return
@@ -570,7 +594,16 @@ def main():
             if process_staging_file(filepath, con, run_ts, logger, fmt):
                 # Run Silver transforms within same transaction as staging insert
                 logger.info("Running silver transforms...")
-                run_silver_transforms(con, logger, session_minutes=30)
+                session_minutes = cfg.get("silver.session_minutes", 30)
+                high_value_threshold = cfg.get(
+                    "silver.high_value_abandoned_checkout", 500
+                )
+                run_silver_transforms(
+                    con,
+                    logger,
+                    session_minutes=session_minutes,
+                    high_value_abandoned_checkout=high_value_threshold,
+                )
                 logger.info("Silver transforms executed successfully.")
 
                 # Commit staging and silver transforms together
@@ -615,7 +648,6 @@ def main():
                 )
             except Exception as rollback_err:
                 logger.error(f"Rollback also failed: {rollback_err}", exc_info=True)
-
 
     con.close()
     logger.info("--- Staging Processing Finished ---")

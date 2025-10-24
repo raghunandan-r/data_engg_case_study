@@ -2,33 +2,44 @@ import json
 import logging
 import os
 import subprocess
-from datetime import datetime
 import sys
+from datetime import datetime
+
 import boto3
-from dotenv import load_dotenv
-from logging_utils import configure_logging
 from diskcache import Cache
+from dotenv import load_dotenv
+
+from config_loader import load_config
+from logging_utils import configure_logging
 
 # --- Configuration ---
 load_dotenv()
-DB_FILE = "nelo_analytics_rewrite.db"
-# TODO: Replace with your actual SQS Queue URL from the AWS Console
-QUEUE_URL = os.getenv("SQS_QUEUE_URL")
-RAW_EVENTS_FILE = "raw_events.jsonl"
-STAGING_DIR = "staging"
-ARCHIVE_DIR = "archive"
+cfg = load_config()
+
+DB_FILE = cfg.get("database_path")
+RAW_EVENTS_FILE = cfg.get("paths.raw_events_file")
+STAGING_DIR = cfg.get("paths.staging_dir")
+ARCHIVE_DIR = cfg.get("paths.archive_dir")
 LOG_FILE = "etl.log"
 
 # --- Logging Setup ---
 # Per-run log with stdout streaming for visibility
-RUN_TS = datetime.now().strftime("%Y%m%d_%H%M%S")
-logger, _fmt = configure_logging(f"logs/etl_{RUN_TS}.log", logger_name="etl")
-seen_msg_cache = Cache("seen_msg_cache")
-MESSAGE_ID_TTL = 1209600 # 2 weeks retention same as SQS max retention.
+RUN_TS = datetime.now().strftime(cfg.get("run_ts_format", "%Y%m%d_%H%M%S"))
+logger, _fmt = configure_logging(
+    f"{cfg.get('paths.logs_dir')}/etl_{RUN_TS}.log", logger_name="etl"
+)
+
+# Initialize disk cache for message deduplication
+cache_dir = cfg.get("paths.cache_dir")
+os.makedirs(cache_dir, exist_ok=True)
+seen_msg_cache = Cache(cache_dir)
+MESSAGE_ID_TTL = cfg.get("sqs.message_cache_ttl_seconds", 1209600)
+
 
 def get_sqs_client():
     """Initializes and returns a boto3 SQS client."""
     try:
+        # Read AWS credentials from environment
         sso_start_url = os.getenv("SSO_START_URL")
         sso_region = os.getenv("SSO_REGION")
         aws_access_key_id = os.getenv("AWS_ACCESS_KEY_ID")
@@ -61,21 +72,27 @@ def get_sqs_client():
         return None
 
 
-def consume_messages(sqs_client, num_messages_to_poll=10000):
+def consume_messages(sqs_client):
     """Consumes a specified number of messages from SQS and appends them to a raw log file."""
+    # Get queue URL from config (deferred until we actually need it)
+    queue_url = cfg.get_env_value("sqs.queue_url_env", required=True)
+    num_messages_to_poll = cfg.get("sqs.polling.max_messages_per_run", 1000)
+    receive_batch_size = cfg.get("sqs.polling.receive_batch_size", 10)
+    wait_time_seconds = cfg.get("sqs.polling.wait_time_seconds", 5)
+
     logging.info(f"Starting to poll for up to {num_messages_to_poll} messages.")
     messages_processed = 0
 
     while messages_processed < num_messages_to_poll:
         try:
-            # Request a batch of 10 messages (the maximum)
+            # Request a batch (AWS max is 10)
             remaining = num_messages_to_poll - messages_processed
-            batch_size = min(remaining, 10)
+            batch_size = min(remaining, receive_batch_size)
 
             response = sqs_client.receive_message(
-                QueueUrl=QUEUE_URL,
+                QueueUrl=queue_url,
                 MaxNumberOfMessages=batch_size,
-                WaitTimeSeconds=5,  # Use long polling
+                WaitTimeSeconds=wait_time_seconds,
             )
 
             messages = response.get("Messages", [])
@@ -85,27 +102,27 @@ def consume_messages(sqs_client, num_messages_to_poll=10000):
 
             with open(RAW_EVENTS_FILE, "a") as f:
                 for msg in messages:
-                    
                     # Check if message has already been processed in cache, to avoid deduplication compute downstream in db.
                     msg_id = msg["MessageId"]
                     if msg_id in seen_msg_cache:
                         logging.info(f"Message {msg_id} already processed. Skipping.")
                         continue
-                    seen_msg_cache.add(msg_id, '1')
+
+                    # Store with TTL to prevent unbounded cache growth
+                    seen_msg_cache.set(msg_id, True, expire=MESSAGE_ID_TTL)
 
                     try:
                         f.write(msg["Body"] + "\n")
                         # No access to delete messages from SQS, however best practice is for upstream service to fan out via SNS
                         # not authorized to perform: sqs:deletemessage on resource: arn:aws:sqs:us-east-1:xxxxx:data-engineering-case-analytics-queue because no identity-based policy allows the sqs:deletemessage action
                         # sqs_client.delete_message(
-                        #     QueueUrl=QUEUE_URL,
+                        #     QueueUrl=queue_url,
                         #     ReceiptHandle=msg['ReceiptHandle']
                         # )
                         messages_processed += 1
 
                     except Exception as e:
                         logging.error(f"Failed to process message: {e}")
-                        
 
             logging.info(
                 f"Consumed {len(messages)} messages. Total processed: {messages_processed}"
@@ -189,7 +206,9 @@ if __name__ == "__main__":
     sqs = get_sqs_client()
     if sqs:
         # For this run, we consume and then immediately process.
-        if consume_messages(sqs, num_messages_to_poll=1000):
+        # Use config default or override with smaller value for testing
+
+        if consume_messages(sqs):
             if process_batch():
                 logging.info("Staging files created. Triggering processing script.")
                 try:
@@ -197,7 +216,7 @@ if __name__ == "__main__":
                     env["RUN_TS"] = RUN_TS
                     # Stream child logs live (no capture_output)
                     result = subprocess.run(
-                        [sys.executable , "process_staging.py"], check=True, env=env
+                        [sys.executable, "process_staging.py"], check=True, env=env
                     )
                     logging.info("Processing script completed successfully.")
                 except FileNotFoundError:
@@ -211,4 +230,4 @@ if __name__ == "__main__":
         else:
             logging.info("No messages were consumed, skipping processing step.")
     logging.info("--- ETL Process Finished ---")
-    # TODO: seen_msg_cache.close()
+    seen_msg_cache.close()

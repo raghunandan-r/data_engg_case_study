@@ -21,6 +21,9 @@ dead_letter.log
 debug_exports/
 *.db.wal
 *.db
+Code/
+dead_letter/
+scripts/
 
 BACKFILL_GUIDE.md
 

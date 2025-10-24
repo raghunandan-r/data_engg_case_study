@@ -1,9 +1,13 @@
+import json
 import logging
 
 import duckdb
 
 # --- Configuration ---
-DB_FILE = "nelo_analytics_rewrite.db"
+# Load database path from config.json
+with open("config.json", "r") as f:
+    config = json.load(f)
+    DB_FILE = config["database_path"]
 LOG_FILE = "etl.log"
 
 # --- Logging Setup ---
@@ -30,8 +34,7 @@ def setup_database():
     event_id VARCHAR,
     event_name VARCHAR,
     event_timestamp TIMESTAMP,
-    replay_timestamp TIMESTAMP,
-    ingestion_timestamp TIMESTAMP,
+    replay_timestamp TIMESTAMP,    
     user_id VARCHAR,
     platform VARCHAR,
 
@@ -61,7 +64,7 @@ def setup_database():
 
     -- Audit
     raw_event JSON,
-    processed_at TIMESTAMP
+    ingestion_timestamp TIMESTAMP,
     );
     """
     )
@@ -77,8 +80,8 @@ def setup_database():
     # Index for filtering unprocessed rows (DuckDB doesn't support partial indexes)
     con.execute(
         """
-    CREATE INDEX IF NOT EXISTS idx_stg_processed
-    ON stg_events(processed_at);
+    CREATE INDEX IF NOT EXISTS idx_stg_ingestion_timestamp
+    ON stg_events(ingestion_timestamp);
     """
     )
 
@@ -105,7 +108,7 @@ def setup_database():
 
     # Users Dimension Creation
     con.execute(
-    """
+        """
         CREATE SEQUENCE IF NOT EXISTS user_sk_seq START 1;
 
         CREATE TABLE IF NOT EXISTS dim_users (
@@ -162,11 +165,10 @@ def setup_database():
         CREATE INDEX IF NOT EXISTS idx_products_nk ON dim_products(product_id);
         CREATE INDEX IF NOT EXISTS idx_products_range ON dim_products(product_id, effective_start_date, effective_end_date);
         """
-    )    
-
+    )
 
     con.execute(
-    """
+        """
     CREATE SEQUENCE IF NOT EXISTS item_list_sk_seq START 1;
 
     CREATE TABLE IF NOT EXISTS dim_item_lists (
@@ -191,7 +193,6 @@ def setup_database():
     """
     )
 
-
     # dim_platforms: Minimal lookup table (no aggregates)
     con.execute(
         "CREATE TABLE IF NOT EXISTS dim_platforms (platform_id INTEGER PRIMARY KEY, platform_name VARCHAR UNIQUE);"
@@ -202,7 +203,7 @@ def setup_database():
 
     # dim_campaigns: Enhanced with performance metrics
     con.execute(
-    """
+        """
     CREATE SEQUENCE IF NOT EXISTS campaign_sk_seq START 1;
 
     CREATE TABLE IF NOT EXISTS dim_campaigns (
@@ -226,10 +227,9 @@ def setup_database():
     """
     )
 
-
     # dim_experiments: Enhanced with conversion and revenue metrics
     con.execute(
-    """
+        """
     CREATE SEQUENCE IF NOT EXISTS experiment_sk_seq START 1;
         
     CREATE TABLE IF NOT EXISTS dim_experiments (
@@ -295,11 +295,30 @@ def setup_database():
         is_in_stock BOOLEAN,
 
         -- Audit metadata
-        ingestion_timestamp TIMESTAMP
+        ingestion_timestamp TIMESTAMP,
+        updated_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
     );
     """
     )
 
+    logging.info("Creating ETL checkpoints table...")
+    con.execute(
+        """
+        -- Ensure checkpoint table exists and seed a pipeline row
+        CREATE TABLE IF NOT EXISTS etl_checkpoints (
+            pipeline VARCHAR PRIMARY KEY,
+            hwm_ts TIMESTAMP NOT NULL,
+            hwm_event_id VARCHAR NOT NULL,
+            last_run_current_batch_rows BIGINT,
+            last_run_net_new_rows BIGINT,
+            updated_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
+        );
+
+        INSERT INTO etl_checkpoints (pipeline, hwm_ts, hwm_event_id)
+        VALUES ('silver_events', TIMESTAMP '1970-01-01', '')
+        ON CONFLICT (pipeline) DO NOTHING;
+    """
+    )
     # Performance indexes
     con.execute(
         """
@@ -320,7 +339,6 @@ def setup_database():
     # """)
     logging.info("Fact table 'fct_events' is set up.")
 
-
     # Silver persisted attribution (reusable in Gold)
     con.execute(
         """
@@ -340,7 +358,6 @@ def setup_database():
     );
     """
     )
-
 
     # Persisted silver list impressions to support session-based, last-touch attribution
     con.execute(
@@ -366,8 +383,8 @@ def setup_database():
         CREATE TABLE IF NOT EXISTS silver_user_sessions (
             user_id VARCHAR,
             platform_id INTEGER,
-            session_start_ts TIMESTAMP,
-            session_end_ts TIMESTAMP,
+            session_start_ts,
+            session_end_ts,
             session_date DATE,
             events_in_session INTEGER,
             views INTEGER,
@@ -389,10 +406,41 @@ def setup_database():
             had_purchase BOOLEAN,
             is_bounce BOOLEAN,
             is_abandoned_checkout BOOLEAN,
-            cart_value_usd DECIMAL(12,6),
+            cart_value DECIMAL(12,2),
             cart_products VARCHAR[],
             is_high_value_abandoned_checkout BOOLEAN,
             PRIMARY KEY (user_id, platform_id, session_start_ts)
+        );
+    """
+    )
+
+    logging.info("Creating silver session campaign last touch table...")
+    con.execute(
+        """
+        CREATE TABLE IF NOT EXISTS silver_session_campaign_last_touch (
+            user_id VARCHAR,
+            platform_id INTEGER,
+            session_id VARCHAR,
+            session_start_ts TIMESTAMP,
+            campaign_id VARCHAR,
+            last_touch_ts TIMESTAMP,
+            updated_at TIMESTAMP,
+            PRIMARY KEY (user_id, platform_id, session_id)
+        );
+        """
+    )
+
+    logging.info("Aggregating daily product performance from net_new...")
+    con.execute(
+        """
+        CREATE TABLE IF NOT EXISTS fct_product_daily_performance (
+            date_id            INTEGER,
+            product_id         VARCHAR,
+            views              BIGINT,
+            checkouts          BIGINT,
+            purchases          BIGINT,
+            revenue            DECIMAL(18, 2),
+            PRIMARY KEY(date_id, product_id)
         );
     """
     )
@@ -418,9 +466,12 @@ def setup_database():
         );
         """
     )
-    con.execute("CREATE INDEX IF NOT EXISTS idx_fpc_campaign ON fct_product_campaigns(campaign_id);")
-    con.execute("CREATE INDEX IF NOT EXISTS idx_fpc_product ON fct_product_campaigns(product_id);")
-
+    con.execute(
+        "CREATE INDEX IF NOT EXISTS idx_fpc_campaign ON fct_product_campaigns(campaign_id);"
+    )
+    con.execute(
+        "CREATE INDEX IF NOT EXISTS idx_fpc_product ON fct_product_campaigns(product_id);"
+    )
 
     con.close()
     logging.info("Database setup complete. Connection closed.")

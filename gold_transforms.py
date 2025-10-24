@@ -21,7 +21,9 @@ def run_gold_transforms(con: duckdb.DuckDBPyConnection, logger: logging.Logger):
         logger.info("--- Gold Layer Transformations Completed Successfully ---")
 
     except Exception as e:
-        logger.error(f"An error occurred during gold transformations: {e}", exc_info=True)
+        logger.error(
+            f"An error occurred during gold transformations: {e}", exc_info=True
+        )
         raise  # Re-raise to allow transaction rollback in the caller
 
 
@@ -95,10 +97,9 @@ def create_gold_product_campaign_semantic_views(con, logger):
         """
     )
 
-
     # Session-based daily list view (no fct_events scan; exposures from silver_list_impressions, actions and revenue from silver_event_list_attribution):
     con.execute(
-    """
+        """
         CREATE OR REPLACE VIEW vw_growth_engagement_daily AS
         WITH sessions AS (
         SELECT
@@ -201,7 +202,7 @@ def create_gold_product_campaign_semantic_views(con, logger):
 
     # Use silver_session_features for funnel and silver_purchases for revenue/installments.
     con.execute(
-    """
+        """
         WITH ud AS (
         SELECT 
             user_id,
@@ -235,7 +236,7 @@ def create_gold_product_campaign_semantic_views(con, logger):
 
     # Segment: users who abandoned a cart but then bought a different product later.
     con.execute(
-    """
+        """
         CREATE OR REPLACE VIEW gold_segment_abandon_then_bought_different_v AS
         WITH abandoned AS (
         SELECT user_id, platform_id, session_start_ts, session_end_ts, cart_products
@@ -260,29 +261,58 @@ def create_gold_product_campaign_semantic_views(con, logger):
 
     # Segments: users who bounced, abandoned a checkout, or abandoned a checkout with a high value.
     con.execute(
-    """
+        """
         -- 1) Bounce
         CREATE OR REPLACE VIEW gold_segment_bounce_v AS
         SELECT *
         FROM silver_session_features
-        WHERE is_bounce;
+        WHERE is_bounce is true;
 
         -- 2) Checkout abandon
         CREATE OR REPLACE VIEW gold_segment_checkout_abandon_v AS
         SELECT *
         FROM silver_session_features
-        WHERE is_abandoned_checkout;
+        WHERE is_abandoned_checkout is true;
 
         -- 3) High-value checkout abandon (> $500)
         CREATE OR REPLACE VIEW gold_segment_high_value_abandon_v AS
         SELECT *
         FROM silver_session_features
-        WHERE is_high_value_abandoned_checkout;
+        WHERE is_high_value_abandoned_checkout is true;
         """
     )
 
     logger.info("Gold product campaign semantic views created.")
 
+
+# In gold_transforms.py
+
+
+def create_gold_views(con):
+    logger.info("Creating gold layer views...")
+
+    con.execute(
+        """
+    CREATE OR REPLACE VIEW gold_product_metrics AS
+    SELECT
+        date_id,
+        product_id,
+        views,
+        checkouts,
+        purchases,
+        revenue,
+        CASE
+            WHEN views > 0 THEN 1.0 * checkouts / views
+            ELSE NULL
+        END AS view_to_checkout_rate,
+        CASE
+            WHEN views > 0 THEN 1.0 * purchases / views
+            ELSE NULL
+        END AS view_to_purchase_rate
+    FROM fct_product_daily_performance;
+    """
+    )
+    logger.info("Successfully created gold_product_metrics view.")
 
 
 if __name__ == "__main__":

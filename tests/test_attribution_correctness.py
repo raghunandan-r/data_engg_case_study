@@ -1,7 +1,7 @@
 # tests/test_attribution_correctness.py
 import json
 import logging
-from datetime import datetime, timezone, timedelta
+from datetime import datetime, timedelta, timezone
 
 import duckdb
 import pandas as pd
@@ -9,6 +9,7 @@ import pytest
 
 import setup_database as db_setup
 from silver_transforms import run_silver_transforms
+
 
 @pytest.fixture()
 def temp_duckdb(tmp_path):
@@ -21,21 +22,50 @@ def temp_duckdb(tmp_path):
     finally:
         con.close()
 
+
 def _insert_stg(con: duckdb.DuckDBPyConnection, rows: list[dict]):
     df = pd.DataFrame(rows)
     con.register("_df", df)
     cols = [
-        "event_id","event_name","event_timestamp","replay_timestamp","ingestion_timestamp",
-        "user_id","platform","item_list_id","item_list_name","product_id","product_name",
-        "price_in_usd","price","quantity","item_revenue_in_usd","item_revenue",
-        "discount_value","total_price","discount_campaigns","discount_experiment_variant",
-        "installments","installment_price","is_in_stock","raw_event","processed_at",
+        "event_id",
+        "event_name",
+        "event_timestamp",
+        "replay_timestamp",
+        "ingestion_timestamp",
+        "user_id",
+        "platform",
+        "item_list_id",
+        "item_list_name",
+        "product_id",
+        "product_name",
+        "price_in_usd",
+        "price",
+        "quantity",
+        "item_revenue_in_usd",
+        "item_revenue",
+        "discount_value",
+        "total_price",
+        "discount_campaigns",
+        "discount_experiment_variant",
+        "installments",
+        "installment_price",
+        "is_in_stock",
+        "raw_event",
+        "processed_at",
     ]
     select_expr = ", ".join(
-        [f"_df.{c}" if c != "raw_event" else "CAST(_df.raw_event AS JSON) AS raw_event" for c in cols]
+        [
+            f"_df.{c}"
+            if c != "raw_event"
+            else "CAST(_df.raw_event AS JSON) AS raw_event"
+            for c in cols
+        ]
     )
-    con.execute(f"INSERT INTO stg_events ({', '.join(cols)}) SELECT {select_expr} FROM _df")
+    con.execute(
+        f"INSERT INTO stg_events ({', '.join(cols)}) SELECT {select_expr} FROM _df"
+    )
     con.unregister("_df")
+
 
 def _evt(eid, name, ts, user, list_id=None):
     return {
@@ -66,6 +96,7 @@ def _evt(eid, name, ts, user, list_id=None):
         "processed_at": None,
     }
 
+
 def test_attribution_within_30_minutes(temp_duckdb):
     con = temp_duckdb
     base = datetime(2025, 1, 1, 12, 0, tzinfo=timezone.utc)
@@ -78,7 +109,9 @@ def test_attribution_within_30_minutes(temp_duckdb):
         _evt("i2", "view_item_list", base + timedelta(minutes=40), "u1", "L2"),
         _evt("v2", "view_item", base + timedelta(minutes=50), "u1"),
         _evt("p2", "purchase", base + timedelta(minutes=55), "u1"),
-        _evt("p3", "purchase", base + timedelta(hours=2), "u1"),  # outside window → no attribution
+        _evt(
+            "p3", "purchase", base + timedelta(hours=2), "u1"
+        ),  # outside window → no attribution
     ]
     _insert_stg(con, rows)
     run_silver_transforms(con, logging.getLogger("silver"), session_minutes=30)

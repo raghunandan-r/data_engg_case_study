@@ -6,52 +6,103 @@ DB_FILE = "nelo_analytics_rewrite.db"
 
 
 def run_silver_transforms(
-    con: duckdb.DuckDBPyConnection, logger: logging.Logger, session_minutes: int = 30, high_value_abandoned_checkout: int = 500
+    con: duckdb.DuckDBPyConnection,
+    logger: logging.Logger,
+    session_minutes: int = 30,
+    high_value_abandoned_checkout: int = 500,
 ) -> None:
     """
-    Run idempotent Silver-layer transforms:
-      - Upsert dim_users, dim_products, dim_item_lists, dim_campaigns, dim_experiments
-      - Insert into fct_events with ON CONFLICT do nothing
-      - Update stg_events.processed_at for rows included in this run
-    Pre-conditions: stg_events contains newly inserted batch rows.
+    Run idempotent Silver-layer transforms using a composite high-watermark on staging:
+      - Build current_batch from stg_events via (ingestion_timestamp, event_id) HWM (no writes to staging)
+      - Dedupe within the batch and anti-join to facts to form net_new
+      - Upsert SCD dimensions, load facts, sessionize, and persist silver artifacts
+    Assumes stg_events is append-only and fct_events dedupes by event_id.
     """
 
-    # First, get all unprocessed staging rows into a temp view for this run
+    # --- Composite HWM (ingestion_timestamp, event_id) ---------------------------------
+    # Uses a stable upper bound captured at the start of the run to avoid race conditions
+    # with new rows arriving in stg_events while Silver is executing.
+    logger.info(" deriving current_batch from HWM...")
+
     con.execute(
         """
+        -- 2) Capture stable bounds for this run into a temp table
+        CREATE OR REPLACE TEMP TABLE silver_hwm AS
+        WITH last AS (
+            SELECT hwm_ts, hwm_event_id FROM etl_checkpoints WHERE pipeline = 'silver_events'
+        ),
+        ub AS (
+            SELECT MAX(ingestion_timestamp) AS upper_ts FROM stg_events
+        ),
+        ub_eid AS (
+            SELECT COALESCE(MAX(event_id), '') AS upper_eid
+            FROM stg_events s
+            JOIN ub ON s.ingestion_timestamp = ub.upper_ts
+        )
+        SELECT
+            (SELECT hwm_ts       FROM last)     AS last_hwm_ts,
+            (SELECT hwm_event_id FROM last)     AS last_hwm_event_id,
+            (SELECT upper_ts     FROM ub)       AS upper_ts,
+            (SELECT upper_eid    FROM ub_eid)   AS upper_eid;
+        -- 3) Current batch = rows strictly after last HWM up to the captured upper bound
         CREATE OR REPLACE TEMP VIEW current_batch AS
-        SELECT * FROM stg_events WHERE processed_at IS NULL;
-    """
-    )
-
-    # Dedupe within batch, then anti-join to facts to get net-new
-    con.execute(
-        """
-        CREATE OR REPLACE TEMP VIEW net_new AS
+        SELECT s.*
+        FROM stg_events s
+        CROSS JOIN silver_hwm h
+        WHERE
+            (h.upper_ts IS NOT NULL) -- no-op when staging is empty
+        AND (
+                (s.ingestion_timestamp >  h.last_hwm_ts AND s.ingestion_timestamp <  h.upper_ts)
+            OR (s.ingestion_timestamp =  h.last_hwm_ts AND s.event_id >  h.last_hwm_event_id)
+            OR (s.ingestion_timestamp =  h.upper_ts     AND s.event_id <= h.upper_eid)
+        );
+        -- 4) Deduplicate within the batch (keep latest by ingestion) and exclude events already in facts
+        CREATE OR REPLACE TEMP TABLE net_new AS
         WITH batch_dedup AS (
             SELECT
-                *,
+                s.*,
                 ROW_NUMBER() OVER (
                     PARTITION BY event_id
                     ORDER BY ingestion_timestamp DESC
                 ) AS rn
-            FROM current_batch
+            FROM current_batch s
         ),
         deduped AS (
             SELECT * FROM batch_dedup WHERE rn = 1
         )
         SELECT d.*
         FROM deduped d
-        LEFT JOIN fct_events f
-            ON f.event_id = d.event_id
+        LEFT JOIN fct_events f ON f.event_id = d.event_id
         WHERE f.event_id IS NULL;
     """
     )
 
+    # Log batch sizes and bounds for observability
+    try:
+        hwm_row = con.execute(
+            """
+            SELECT last_hwm_ts, last_hwm_event_id, upper_ts, upper_eid
+            FROM silver_hwm
+            """
+        ).fetchone()
+        current_batch_count = con.execute(
+            "SELECT COUNT(*) FROM current_batch"
+        ).fetchone()[0]
+        net_new_count = con.execute("SELECT COUNT(*) FROM net_new").fetchone()[0]
+        logger.info(
+            f"HWM bounds: last=({hwm_row[0]}, {hwm_row[1]}), upper=({hwm_row[2]}, {hwm_row[3]}); "
+            f"current_batch_rows={current_batch_count}, net_new_rows={net_new_count}"
+        )
+
+    except Exception:
+        # Non-fatal: continue without detailed HWM logs
+        current_batch_count = None
+        net_new_count = None
+
     # Users
     logger.info("Upserting into dim_users...")
     con.execute(
-    """        
+        """        
         -- Currently active SCD rows
         CREATE OR REPLACE TEMP VIEW current_users AS
         SELECT * FROM dim_users WHERE is_active = TRUE;
@@ -190,7 +241,7 @@ def run_silver_transforms(
 
     logger.info("Upserting into dim_products...")
     con.execute(
-    """
+        """
         -- 1) Latest-per-day per product from net_new
         CREATE OR REPLACE TEMP VIEW product_day AS
         WITH ranked AS (
@@ -276,8 +327,6 @@ def run_silver_transforms(
     )
     logger.info("Successfully upserted into dim_products.")
 
-
-
     # Item lists - minimal SCD2 (attribute-only, no metrics in dim)
     logger.info("Upserting into dim_item_lists (SCD2)...")
     con.execute(
@@ -341,7 +390,6 @@ def run_silver_transforms(
     """
     )
     logger.info("Successfully upserted into dim_item_lists (SCD2).")
-
 
     logger.info("Upserting into dim_campaigns (SCD2)...")
     con.execute(
@@ -435,7 +483,6 @@ def run_silver_transforms(
     """
     )
     logger.info("Successfully upserted into dim_campaigns (SCD2).")
-
 
     logger.info("Upserting into dim_experiments (SCD2)...")
     con.execute(
@@ -534,7 +581,7 @@ def run_silver_transforms(
         DROP TABLE IF EXISTS temp_changes;
     """
     )
-    logger.info("Successfully upserted into dim_experiments (SCD2).") 
+    logger.info("Successfully upserted into dim_experiments (SCD2).")
 
     logger.info("Upserting into fct_product_campaigns (incremental, from net_new)...")
     con.execute(
@@ -606,7 +653,6 @@ def run_silver_transforms(
     )
     logger.info("Successfully upserted fct_product_campaigns.")
 
-
     # Fact insert - load all immutable measures
     # See plan/fct_events_design_analysis.md for field rationale
     logger.info("Loading fct_events...")
@@ -648,7 +694,8 @@ def run_silver_transforms(
             is_in_stock,
 
             -- Audit
-            ingestion_timestamp
+            ingestion_timestamp,
+            updated_at
         )
         SELECT
             -- Identifiers
@@ -686,7 +733,8 @@ def run_silver_transforms(
             stg.is_in_stock,
 
             -- Audit
-            stg.ingestion_timestamp
+            now() as ingestion_timestamp,
+            now() as updated_at
 
         FROM net_new stg
         LEFT JOIN dim_platforms p ON UPPER(stg.platform) = p.platform_name
@@ -695,28 +743,76 @@ def run_silver_transforms(
     )
     logger.info("Successfully loaded into fct_events.")
 
+    logger.info("Upserting into fct_product_daily_performance...")
+    con.execute(
+        """
+        WITH daily_agg AS (
+            SELECT
+                CAST(strftime('%Y%m%d', event_timestamp) AS INTEGER) AS date_id,
+                product_id,
+                COUNT(CASE WHEN event_name = 'view_item' THEN 1 END) AS views,
+                COUNT(CASE WHEN event_name = 'begin_checkout' THEN 1 END) AS checkouts,
+                COUNT(CASE WHEN event_name = 'purchase' THEN 1 END) AS purchases,
+                SUM(CASE WHEN event_name = 'purchase' THEN item_revenue ELSE 0 END) AS revenue
+            FROM net_new
+            WHERE product_id IS NOT NULL
+            GROUP BY 1, 2
+        )
+        INSERT INTO fct_product_daily_performance (
+            date_id, product_id, views, checkouts, purchases, revenue
+        )
+        SELECT date_id, product_id, views, checkouts, purchases, revenue
+        FROM daily_agg
+        ON CONFLICT(date_id, product_id) DO UPDATE SET
+            views     = fct_product_daily_performance.views + EXCLUDED.views,
+            checkouts = fct_product_daily_performance.checkouts + EXCLUDED.checkouts,
+            purchases = fct_product_daily_performance.purchases + EXCLUDED.purchases,
+            revenue   = fct_product_daily_performance.revenue + EXCLUDED.revenue;
+    """
+    )
+    logger.info("Successfully updated fct_product_daily_performance.")
 
-    
     logger.info("Sessionizing events and preparing list impressions...")
     # 0) Bring in pre-history equal to the session window to bridge batch boundaries
     con.execute(
         f"""
+        -- Identify impacted actors to scope prehistory, and compute batch lower bound
+        CREATE OR REPLACE TEMP VIEW impacted AS
+        SELECT DISTINCT user_id, UPPER(platform) AS platform_name
+        FROM net_new
+        WHERE user_id IS NOT NULL;
+
+        CREATE OR REPLACE TEMP VIEW bounds AS
+        SELECT MIN(event_timestamp) AS min_ts FROM net_new;
+
+        -- Prehistory strictly before this batch's earliest event, within the session window
+        CREATE OR REPLACE TEMP VIEW prehistory AS
+        SELECT
+          fe.event_id,
+          fe.event_name,
+          fe.event_timestamp,
+          fe.user_id,
+          p.platform_name
+        FROM fct_events fe
+        JOIN dim_platforms p USING (platform_id)
+        JOIN impacted i
+          ON i.user_id = fe.user_id
+         AND i.platform_name = p.platform_name
+        JOIN bounds b
+          ON fe.event_timestamp >= b.min_ts - INTERVAL '{session_minutes} minutes'
+         AND fe.event_timestamp <  b.min_ts
+        LEFT JOIN net_new n ON n.event_id = fe.event_id   -- belt-and-suspenders
+        WHERE n.event_id IS NULL;
+
+        -- Final window: current batch + just enough prehistory to split sessions
         CREATE OR REPLACE TEMP VIEW events_window AS
         SELECT
           event_id, event_name, event_timestamp, user_id, UPPER(platform) AS platform_name
         FROM net_new
         UNION ALL
         SELECT
-          NULL AS event_id,
-          event_name,
-          event_timestamp,
-          user_id,
-          p.platform_name AS platform_name
-        FROM fct_events fe
-        LEFT JOIN dim_platforms p USING (platform_id)
-        WHERE fe.event_timestamp >= (
-          SELECT MIN(event_timestamp) - INTERVAL '{session_minutes} minutes' FROM net_new
-        );
+          event_id, event_name, event_timestamp, user_id, platform_name
+        FROM prehistory;
         """
     )
 
@@ -766,12 +862,34 @@ def run_silver_transforms(
         FROM numbered;
         """
     )
+    # Debug counts after sessionization
+    try:
+        sessionized_cnt = con.execute(
+            "SELECT COUNT(*) FROM sessionized_events"
+        ).fetchone()[0]
+        # Count distinct session groups (by grouping key)
+        session_groups_cnt = con.execute(
+            """
+            WITH session_groups AS (
+              SELECT user_id, platform_id, session_start_ts
+              FROM sessionized_events
+              GROUP BY user_id, platform_id, session_start_ts
+            )
+            SELECT COUNT(*) FROM session_groups
+            """
+        ).fetchone()[0]
+        logger.info(
+            f"Debug counts: sessionized_events_rows={sessionized_cnt}, session_groups={session_groups_cnt}"
+        )
+    except Exception as e:
+        logger.info(f"Debug counts (sessionized) unavailable: {e}")
 
     # 2) Materialize impressions (current batch + pre-history within the window)
     con.execute(
         f"""
         CREATE OR REPLACE TEMP VIEW list_impressions_source AS
         SELECT
+          n.event_id,          
           n.user_id,
           p.platform_id,
           n.item_list_id,
@@ -783,6 +901,7 @@ def run_silver_transforms(
         UNION ALL
 
         SELECT
+          fe.event_id,
           fe.user_id,
           fe.platform_id,
           fe.item_list_id,
@@ -791,7 +910,10 @@ def run_silver_transforms(
         WHERE fe.event_name = 'view_item_list'
           AND fe.item_list_id IS NOT NULL
           AND fe.event_timestamp >= (
-            SELECT MIN(event_timestamp) - INTERVAL '{session_minutes} minutes' FROM net_new
+            SELECT min_ts - INTERVAL '{session_minutes} minutes' FROM bounds
+          )
+          AND fe.event_timestamp < (
+            SELECT min_ts FROM bounds
           );
         """
     )
@@ -800,6 +922,7 @@ def run_silver_transforms(
         """
         CREATE OR REPLACE TEMP TABLE list_impressions AS
         SELECT
+          li.event_id,
           li.user_id,
           li.platform_id,
           li.item_list_id,
@@ -809,9 +932,7 @@ def run_silver_transforms(
           se.session_id
         FROM list_impressions_source li
         JOIN sessionized_events se
-          ON se.user_id = li.user_id
-         AND se.platform_id = li.platform_id
-         AND se.event_timestamp = li.impression_ts;
+          ON se.event_id = li.event_id
         """
     )
 
@@ -834,8 +955,8 @@ def run_silver_transforms(
             WHERE li.user_id = se.user_id
               AND li.platform_id = se.platform_id
               AND li.session_id = se.session_id
-              AND li.impression_ts < se.event_timestamp
-            ORDER BY li.impression_ts DESC
+              AND li.impression_ts <= se.event_timestamp
+            ORDER BY li.impression_ts DESC, li.event_id DESC
             LIMIT 1
           ) AS item_list_id,
           (
@@ -844,8 +965,8 @@ def run_silver_transforms(
             WHERE li.user_id = se.user_id
               AND li.platform_id = se.platform_id
               AND li.session_id = se.session_id
-              AND li.impression_ts < se.event_timestamp
-            ORDER BY li.impression_ts DESC
+              AND li.impression_ts <= se.event_timestamp
+            ORDER BY li.impression_ts DESC, li.event_id DESC
             LIMIT 1
           ) AS impression_ts_chosen
         FROM sessionized_events se
@@ -913,19 +1034,91 @@ def run_silver_transforms(
     )
     logger.info("Successfully persisted silver list attribution.")
 
-
-    # Mark staged rows as processed
-    logger.info("Marking staged events as processed...")
+    logger.info("Persisting silver session campaign last-touch attribution...")
     con.execute(
         """
-        UPDATE stg_events
-        SET processed_at = NOW()
-        WHERE processed_at IS NULL
-        AND event_id IN (SELECT event_id FROM current_batch);
-    """
+        -- 1. Explode campaign touches from the current batch
+        WITH campaign_events AS (
+            SELECT
+                event_id,
+                event_timestamp,
+                UNNEST(string_split(discount_campaigns, '|')) AS campaign_id
+            FROM net_new
+            WHERE discount_campaigns IS NOT NULL AND discount_campaigns <> ''
+        ),
+        -- 2. Join with session data and find the last touch for each session
+        last_touch_per_session AS (
+            SELECT
+                se.user_id,
+                se.platform_id,
+                se.session_id,
+                se.session_start_ts,
+                ce.campaign_id,
+                ce.event_timestamp AS last_touch_ts,
+                ROW_NUMBER() OVER (
+                    PARTITION BY se.session_id
+                    ORDER BY ce.event_timestamp DESC, ce.event_id DESC -- Tie-break for determinism
+                ) as rn
+            FROM sessionized_events se
+            JOIN campaign_events ce ON ce.event_id = se.event_id
+        )
+        -- 3. Insert the winning last-touch record for each session
+        INSERT INTO silver_session_campaign_last_touch (
+            user_id,
+            platform_id,
+            session_id,
+            session_start_ts,
+            campaign_id,
+            last_touch_ts,
+            updated_at
+        )
+        SELECT
+            user_id,
+            platform_id,
+            session_id,
+            session_start_ts,
+            campaign_id,
+            last_touch_ts,
+            CURRENT_TIMESTAMP AS updated_at
+        FROM last_touch_per_session
+        WHERE rn = 1
+        ON CONFLICT (user_id, platform_id, session_id) DO UPDATE SET
+            campaign_id   = EXCLUDED.campaign_id,
+            last_touch_ts = EXCLUDED.last_touch_ts,
+            updated_at    = EXCLUDED.updated_at;
+        """
     )
-    logger.info("Successfully marked staged events as processed.")
+    logger.info(
+        "Successfully persisted silver session campaign last-touch attribution."
+    )
 
+    # Advance the ETL checkpoint to this run's captured upper bound (if any)
+    logger.info("Advancing ETL checkpoint to this run's upper bound...")
+
+    # Persist checkpoint and batch counts
+    con.execute(
+        """
+        UPDATE etl_checkpoints
+        SET
+            hwm_ts = (SELECT MAX(event_timestamp) FROM net_new),
+            hwm_event_id = (SELECT event_id FROM net_new ORDER BY event_timestamp DESC, event_id DESC LIMIT 1),
+            last_run_current_batch_rows = ?,
+            last_run_net_new_rows = ?,
+            updated_at = CURRENT_TIMESTAMP
+        WHERE pipeline = 'silver_events'
+        """,
+        (current_batch_count, net_new_count),
+    )
+
+    # Final observability: how many staging rows were processed this run
+    try:
+        if current_batch_count is None:
+            current_batch_count = con.execute(
+                "SELECT COUNT(*) FROM current_batch"
+            ).fetchone()[0]
+        logger.info(f"Silver processed {current_batch_count} staging rows in this run.")
+    except Exception:
+        pass
 
     logger.info("Creating silver purchases view...")
     con.execute(
@@ -955,7 +1148,7 @@ def run_silver_transforms(
 
     logger.info("Sessionized events in Silver Layer")
     con.execute(
-    """
+        """
         -- A) Aggregate sessions from sessionized_events once per batch
         WITH session_agg AS (
         SELECT
@@ -973,33 +1166,57 @@ def run_silver_transforms(
                 -- the same session grouping you used to derive session_id/session_start_ts
                 session_start_ts
         )
-        INSERT INTO silver_user_sessions
-        SELECT *
+        INSERT INTO silver_user_sessions (
+          user_id, platform_id, session_start_ts, session_end_ts, session_date,
+          events_in_session, views, checkouts, purchases
+        )
+        SELECT 
+            user_id,
+            platform_id,
+            session_start_ts,
+            session_end_ts,
+            session_date,
+            events_in_session,
+            views,
+            checkouts,
+            purchases
         FROM session_agg
-        ON CONFLICT (user_id, platform_id, session_start_ts) DO NOTHING;
-    """)
+        ON CONFLICT (user_id, platform_id, session_start_ts) DO UPDATE SET
+            session_end_ts = EXCLUDED.session_end_ts,
+            session_date = EXCLUDED.session_date,
+            events_in_session = EXCLUDED.events_in_session,
+            views = EXCLUDED.views,
+            checkouts = EXCLUDED.checkouts,
+            purchases = EXCLUDED.purchases;
+    """
+    )
     logger.info("Successfully created silver sessionized events view.")
 
-    logger.info("Building features and cart metrics per session in silver_session_features")
-        # -- B) Build features and cart metrics per session (single pass join to fct_events)
+    logger.info(
+        "Building features and cart metrics per session in silver_session_features"
+    )
+    # -- B) Build features and cart metrics per session (single pass join to fct_events)
     con.execute(
-    f"""
+        f"""
         WITH cart AS (
-        SELECT
-            s.user_id, s.platform_id, s.session_start_ts,
-            SUM(
-            DISTINCT(CASE
-                WHEN fe.event_name = 'begin_checkout'
-                THEN fe.price 
-            END
-            ) AS cart_value,
-            LIST(DISTINCT CASE WHEN fe.event_name = 'begin_checkout' THEN fe.product_id END) AS cart_products
-        FROM silver_user_sessions s
-        LEFT JOIN fct_events fe
-            ON fe.user_id = s.user_id
-            AND fe.platform_id = s.platform_id
-            AND fe.event_timestamp BETWEEN s.session_start_ts AND s.session_end_ts
-        GROUP BY s.user_id, s.platform_id, s.session_start_ts
+            WITH checkout_lines AS (
+                SELECT DISTINCT
+                s.user_id, s.platform_id, s.session_start_ts,
+                fe.event_id, fe.product_id,
+                fe.price * fe.quantity AS line_value
+                FROM silver_user_sessions s
+                JOIN fct_events fe
+                    ON fe.user_id = s.user_id
+                    AND fe.platform_id = s.platform_id
+                    AND fe.event_timestamp BETWEEN s.session_start_ts AND s.session_end_ts
+                WHERE fe.event_name = 'begin_checkout'
+            )
+            SELECT
+                user_id, platform_id, session_start_ts,
+                SUM(line_value) AS cart_value,
+                LIST(DISTINCT product_id) AS cart_products
+            FROM checkout_lines
+            GROUP BY user_id, platform_id, session_start_ts
         )
         INSERT INTO silver_session_features (
             user_id, platform_id, session_start_ts, session_end_ts, session_date,
@@ -1039,11 +1256,3 @@ def run_silver_transforms(
         """
     )
     logger.info("Successfully created silver sessionized events view.")
-
-    con.execute(
-    """
-        DROP VIEW IF EXISTS current_batch;
-        DROP VIEW IF EXISTS net_new;        
-    """
-    )
-    

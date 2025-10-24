@@ -1,6 +1,6 @@
 {
     "environment": "production",
-    "database_path": "nelo_analytics_rewrite.db",
+    "database_path": "nelo_analytics_session_fix.db",
     "paths": {
       "raw_events_file": "raw_events.jsonl",
       "staging_dir": "staging",
@@ -14,7 +14,7 @@
     "sqs": {
       "queue_url_env": "SQS_QUEUE_URL",
       "polling": {
-        "max_messages_per_run": 10000,
+        "max_messages_per_run": 1000,
         "receive_batch_size": 10,
         "wait_time_seconds": 5
       },
